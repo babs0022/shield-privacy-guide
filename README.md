@@ -300,6 +300,6 @@ We welcome contributions to improve this guide! Please see our contribution guid
 
 ---
 
-**Last Updated**: 2024
-**Maintainer**: Shield Community
+**Last Updated**: 2025
+**Maintainer**: Babsbuild
 **License**: MIT

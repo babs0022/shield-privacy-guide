@@ -95,8 +95,8 @@ Encrypted content is stored off-chain:
 A secure link encodes all necessary access information:
 
 ```
-https://shield.app/share/[POLICY_ID]/[ENCRYPTED_KEY]
-                         ↓               ↓
+[https://shield.app/share/[POLICY_ID]/[ENCRYPTED_KEY]
+](https://app.shieldhq.xyz/r/[POLICY_ID]#[ENCRYPTED_KEY])                         ↓               ↓
               On-chain verification    URL parameter
                 (contract lookup)      (client-side decryption)
 ```
@@ -267,7 +267,7 @@ const { policyId, encryptionKey } = await shield.shareContent(
   recipientAddress,
   expiryTime
 );
-const link = `https://shield.app/share/${policyId}/${encryptionKey}`;
+const link = ``https://app.shieldhq.xyz/r/${policyId}#${encryptionKey}`;
 
 // Recipient: Access
 const content = await shield.accessContent(policyId, encryptionKey);

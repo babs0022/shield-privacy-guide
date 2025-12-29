@@ -9,9 +9,11 @@ The secure link is the critical bridge between the blockchain's access control a
 ### Anatomy of a Shield Link
 
 ```
-https://shield.app/share/[POLICY_ID]/[ENCRYPTED_KEY]/[OPTIONAL_METADATA]
-                        └─────────────────────┬─────────────────────┘
-                                     Link Components
+https://app.shieldhq.xyz/r/[POLICY_ID]#[JWK_ENCODED_KEY]
+                        └──────────┬──────────┘ └────────┬─────────┘
+                                   │                      │
+                        On-chain verification     Client-side decryption
+                        (contract lookup)         (URL hash fragment)
 ```
 
 **POLICY_ID**: 
@@ -20,21 +22,16 @@ https://shield.app/share/[POLICY_ID]/[ENCRYPTED_KEY]/[OPTIONAL_METADATA]
 - Enables access verification
 - Immutable once created
 
-**ENCRYPTED_KEY**:
-- Client-side encryption key
-- URL parameter (not stored on-chain)
+**JWK_ENCODED_KEY**:
+- JSON Web Key format encryption key
+- URL-encoded in hash fragment
+- Never sent to server
 - Necessary for decryption
-- Sensitive - must be protected
-
-**OPTIONAL_METADATA**:
-- Share expiry indicators
-- Content type hints
-- Recipient identifiers (hashed)
 
 ### Example Link
 
 ```
-https://shield.app/share/0x7a4b2c1e9f3d5a8b6c2e4f7a9b1d3e5f/aGVsbG8d29sdGQzd29ybGQ
+https://app.shieldhq.xyz/r/0xa5363e6ef2c6703307a827621fe6c6577d0d4407ef7714787a50f45b69736bbc#%7B%22alg%22%3A%22A256GCM%22%2C%22ext%22%3Atrue%2C%22k%22%3A%22vJ38vtHNx2-jrEtNOMqK9X-03JtItJXoPylPYEq6b68%22%2C%22key_ops%22%3A%5B%22encrypt%22%2C%22decrypt%22%5D%2C%22kty%22%3A%22oct%22%7D
 ```
 
 ## Link Generation Process
@@ -51,7 +48,7 @@ function generateEncryptionKey() {
   // - 256 bits (32 bytes) for AES-256
   // - Cryptographically secure source
   // - Never stored on-chain
-  // - Included only in URL
+  // - Included only in URL hash fragment
   
   return key;
 }
@@ -110,10 +107,6 @@ async function uploadToIPFS(encryptedContent, pinataApiKey) {
   );
   
   const { IpfsHash } = await response.json();
-  
-  // IpfsHash is the Content Identifier (CID)
-  // Example: QmXxxx...xxxxx
-  
   return IpfsHash;
 }
 ```
@@ -161,49 +154,35 @@ function createPolicy(
 
 ```javascript
 function constructLink(policyId, encryptionKey, ipfsHash) {
-  // Encode encryption key (hex format)
-  const keyHex = Array.from(encryptionKey)
-    .map(b => b.toString(16).padStart(2, '0'))
-    .join('');
+  // Create JWK from encryption key
+  const jwk = {
+    alg: "A256GCM",
+    ext: true,
+    k: base64url(encryptionKey),
+    key_ops: ["encrypt", "decrypt"],
+    kty: "oct"
+  };
   
-  // Base URL
-  const baseUrl = 'https://shield.app/share';
+  // URL encode JWK
+  const encodedJwk = encodeURIComponent(JSON.stringify(jwk));
   
-  // Construct full link
-  const link = `${baseUrl}/${policyId}/${keyHex}`;
+  // Construct link with correct format
+  const link = `https://app.shieldhq.xyz/r/${policyId}#${encodedJwk}`;
   
-  // Optional: Add metadata
-  const linkWithMetadata = `${link}?ipfs=${ipfsHash}`;
-  
-  return linkWithMetadata;
+  return link;
 }
 ```
 
 ## Link Validation
 
-### Recipient Receives Link
-
-```javascript
-function parseLink(link) {
-  // Example: https://shield.app/share/0x7a4b.../aGVs...
-  
-  const urlParams = new URL(link);
-  const pathParts = urlParams.pathname.split('/');
-  
-  return {
-    policyId: pathParts[3],      // 0x7a4b...
-    encryptionKey: pathParts[4],  // aGVs...
-    ipfsHash: urlParams.searchParams.get('ipfs')
-  };
-}
-```
-
-### Verification Process
+### Recipient Accesses Link
 
 ```javascript
 async function verifyAndAccessContent(link, recipientAddress) {
   // 1. Parse link
-  const { policyId, encryptionKey, ipfsHash } = parseLink(link);
+  const url = new URL(link);
+  const policyId = url.pathname.split('/r/')[1];
+  const jwkEncoded = url.hash.substring(1);
   
   // 2. Query smart contract
   const policy = await contract.policies(policyId);
@@ -223,157 +202,80 @@ async function verifyAndAccessContent(link, recipientAddress) {
     throw new Error('Max attempts exceeded');
   }
   
-  // 6. Fetch from IPFS
-  const encryptedContent = await fetchFromIPFS(ipfsHash);
-  
-  // 7. Decrypt content
-  const decryptedContent = await decryptContent(
-    encryptedContent,
-    encryptionKey
+  // 6. Decode JWK and decrypt
+  const jwk = JSON.parse(decodeURIComponent(jwkEncoded));
+  const key = await crypto.subtle.importKey(
+    "jwk",
+    jwk,
+    { name: "AES-GCM" },
+    true,
+    ["decrypt"]
   );
   
-  // 8. Log attempt
+  // 7. Fetch and decrypt content
+  const encrypted = await fetchFromIPFS(ipfsHash);
+  const decrypted = await crypto.subtle.decrypt(
+    { name: "AES-GCM", iv: /* from encrypted */ },
+    key,
+    encrypted
+  );
+  
+  // 8. Log access attempt
   await contract.logAttempt(policyId, true);
   
-  return decryptedContent;
+  return decrypted;
 }
 ```
 
 ## Security Considerations
 
-### Key Protection
+### Why URL Hash Fragment?
 
-1. **Transport Security**: Always use HTTPS
-2. **Link Sharing**: Treat links as sensitive as passwords
-3. **Browser History**: Links appear in browser history (user responsibility)
-4. **Link Expiry**: Set reasonable expiration times
-5. **Attempt Limiting**: Prevent brute force attempts
+1. **Not sent to server**: Hash fragment stays in browser, never transmitted
+2. **Server cannot access keys**: Only sees policy ID, never the encryption key
+3. **Client-side decryption**: Keys remain secure in browser memory
+4. **No logging of keys**: Server logs don't contain sensitive encryption material
 
-### Attack Vectors
+### Attack Prevention
 
-#### 1. Brute Force Decryption
-
-**Risk**: Attacker intercepts encrypted content and tries keys
-**Mitigation**: 
+#### Brute Force Decryption
 - AES-256 provides 2^256 possible keys
 - Computationally infeasible to brute force
-- Add attempt limiting on contract
+- Attempt limiting on smart contract prevents repeated tries
 
-#### 2. Link Interception
+#### Link Interception
+- Use HTTPS-only links
+- Share over secure channels
+- Time-limited access through smart contract expiry
 
-**Risk**: Attacker intercepts link in transit
-**Mitigation**:
-- HTTPS encryption
-- Only share over secure channels
-- Time-limited links
-
-#### 3. IPFS Enumeration
-
-**Risk**: Attacker tries to guess IPFS hashes
-**Mitigation**:
+#### IPFS Enumeration
 - IPFS hashes are cryptographically secure
 - Content-addressed (impossible to enumerate)
-- Only accessible with valid policy
-
-## Link Lifecycle
-
-```
-┌─────────────┐
-│Link Created │
-│  by Sender  │
-└──────┬──────┘
-       │
-       ▼
-┌──────────────┐
-│ Link Active  │
-│ Shared with  │
-│ Recipient    │
-└──────┬───────┘
-       │
-       ├─ If Recipient Accesses
-       │  ↓
-       │ ┌──────────────┐
-       │ │ Decryption   │
-       │ │ Successful   │
-       │ │ Access       │
-       │ │ Logged       │
-       │ └──────┬───────┘
-       │        │
-       │        ├─ If Attempts < maxAttempts
-       │        │  ↓
-       │        │ ┌──────────────┐
-       │        │ │ Can Access   │
-       │        │ │ Again        │
-       │        │ └──────────────┘
-       │        │
-       │        └─ If Attempts ≥ maxAttempts
-       │           ↓
-       │        ┌──────────────┐
-       │        │ Access       │
-       │        │ Blocked      │
-       │        └──────────────┘
-       │
-       └─ If Expiry Time Passes
-          ↓
-       ┌──────────────┐
-       │ Link Expired │
-       │ Access       │
-       │ Denied       │
-       └──────────────┘
-```
+- Only accessible with valid policy AND key
 
 ## Best Practices
 
-### For Link Creators (Senders)
+### For Senders
+1. Verify recipient address before creating policy
+2. Set appropriate expiry times (hours/days, not years)
+3. Limit access attempts to prevent brute force
+4. Monitor access through contract events
+5. Use secure channels to share links
 
-1. **Set Appropriate Expiry**: Balance between recipient access time and security
-2. **Limit Attempts**: Prevent repeated decryption attempts
-3. **Verify Recipient Address**: Ensure correct recipient authorization
-4. **Use HTTPS**: Always share links over secure channels
-5. **Document Expiry**: Inform recipient when access expires
-6. **Monitor Access**: Review contract events for access attempts
-
-### For Link Recipients
-
-1. **Verify Link Source**: Confirm link comes from trusted sender
-2. **Use HTTPS**: Access link over secure connection
-3. **Save Content**: Download/save before expiry if needed
-4. **Protect the Link**: Don't forward to untrusted parties
-5. **Check Expiry**: Be aware of access window
-6. **Verify Content**: Confirm received content is as expected
+### For Recipients
+1. Verify link source and authenticity
+2. Check domain is app.shieldhq.xyz
+3. Protect the link (contains encryption key)
+4. Access before expiry time
+5. Do not forward to untrusted parties
 
 ### For Developers
-
-1. **Validate Inputs**: Check all link components
-2. **Error Handling**: Provide clear error messages
-3. **Rate Limiting**: Prevent rapid access attempts
-4. **Logging**: Log all access attempts
-5. **Timeout Handling**: Handle long-running decryption
-6. **User Feedback**: Clear status during decryption process
-
-## Advanced Features
-
-### Conditional Access
-
-Links could be extended to require:
-- Multi-signature authorization
-- Time-based access windows
-- Geographic restrictions
-- Device-specific decryption
-
-### Link Delegation
-
-```solidity
-// Future: Allow recipient to delegate access
-function delegateAccess(
-  bytes32 policyId,
-  address newRecipient
-) external {
-  require(msg.sender == policies[policyId].recipient);
-  policies[policyId].recipient = newRecipient;
-}
-```
+1. Validate all link components before use
+2. Handle decryption errors gracefully
+3. Implement retry logic with backoff
+4. Log access attempts for audit trails
+5. Test with real links before deployment
 
 ## Conclusion
 
-Shield's link generation system balances convenience with security. By keeping encryption keys out of the blockchain and using time-limited, attempt-limited access policies, it ensures secure data sharing without trusting centralized servers.
+Shield's secure link format combines on-chain access control with client-side encryption. The URL hash fragment approach ensures encryption keys never reach the server, while POLICY_ID on the blockchain manages access permissions. This design provides maximum security and privacy for shared sensitive content.
